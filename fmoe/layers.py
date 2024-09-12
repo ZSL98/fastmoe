@@ -46,6 +46,9 @@ def _fmoe_general_global_forward(inp, gate, expert_fn, num_expert, world_size, *
     if len(gate.shape) == 2:
         topk = gate.shape[1]
 
+    # print("gate: ", gate.size())
+    # print("global_expert_count: ", global_expert_count)
+
     def scatter_func(tensor):
         return MOEScatter.apply(
             tensor,
@@ -83,6 +86,18 @@ if switch_from_env('FMOE_FASTER_SCHEDULE_ENABLE', False):
     fmoe_faster_schedule = True
     from .fastermoe.schedule import _fmoe_general_global_forward
 
+def generate_scatter_index(splits, num_tokens, topk):
+
+    # generate choosed experts
+    choosed_experts = torch.zeros((num_tokens, topk), dtype=torch.int64)
+    bin_counter = torch.clone(splits)
+    offsets = torch.cumsum(splits, dim=0) - splits
+    for tid in range(num_tokens):
+        bin_size, bins = torch.topk(bin_counter, topk)
+        choosed_experts[tid] = bins
+        bin_counter[bins] -= 1
+
+    return choosed_experts
 
 class FMoE(nn.Module):
     r"""
@@ -160,6 +175,21 @@ class FMoE(nn.Module):
         self.mask = mask
         self.mask_dict = mask_dict
         self.moe_group = moe_group
+
+        seq_length = int(os.environ.get("SEQ_LEN", 16384))
+        test_type = os.environ.get("TEST_TYPE", "e2e")
+        if test_type == 'e2e':
+            tp_size = int(os.environ.get("TP_SIZE", 8))
+        else:
+            tp_size = 8
+        WORLD_SIZE = 8
+        token_per_rank = seq_length // tp_size
+        global_num_expert = num_expert * 8
+        token_per_expert = token_per_rank * top_k * WORLD_SIZE // global_num_expert
+        self.splits_cpu = torch.tensor([token_per_expert] * global_num_expert, dtype=torch.int32)
+        self.choosed_experts_all_token = generate_scatter_index(self.splits_cpu, token_per_rank * WORLD_SIZE, top_k)
+        RANK = torch.distributed.get_rank()
+        self.indices = self.choosed_experts_all_token[RANK * token_per_rank : (RANK+1) * token_per_rank].to(torch.long).cuda()
 
     def expert_fn(self, inp, fwd_expert_count):
         r"""
@@ -249,7 +279,7 @@ class FMoE(nn.Module):
             gate_top_k_idx = gate_top_k_idx[mask == 0, :]
 
         fwd = _fmoe_general_global_forward(
-            moe_inp, gate_top_k_idx, self.expert_fn_single if fmoe_faster_schedule else self.expert_fn,
+            moe_inp, self.indices, self.expert_fn_single if fmoe_faster_schedule else self.expert_fn,
             self.num_expert, self.world_size,
             experts=self.experts
         )
